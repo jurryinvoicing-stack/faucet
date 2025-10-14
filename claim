@@ -1,0 +1,353 @@
+ # View the main faucet logic
+cat /opt/apps/api/modules/freebies/faucet.js
+
+# View the freebies module
+cat /opt/apps/api/modules/freebies/index.js
+'use strict';
+
+const fetch = global.fetch || require('node-fetch');
+const jwt   = require('jsonwebtoken');
+
+const SUPABASE_REST_URL         = process.env.SUPABASE_REST_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const COOKIE_NAME               = process.env.SESSION_COOKIE_NAME || 'pc_session';
+const JWT_SECRET                = process.env.JWT_SECRET || 'dev_only_change_me';
+
+const COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3 hours
+const AMOUNT      = 300;
+
+function nowIso() { return new Date().toISOString(); }
+
+function readSession(req) {
+  try {
+    const t = req.cookies?.[COOKIE_NAME];
+    if (!t) return null;
+    return jwt.verify(t, JWT_SECRET);
+  } catch { return null; }
+}
+
+function requireUser(req, res, next) {
+  const s = readSession(req);
+  if (!s || !s.id) return res.status(401).json({ error: 'no_session' });
+  const role = s.role || s.type;
+  if (role !== 'user') return res.status(403).json({ error: 'guest_not_allowed' });
+  req.user = s; next();
+}
+
+async function sbRest(path, init = {}) {
+  const base = SUPABASE_REST_URL.replace(/\/+$/,'');
+  const url  = `${base}/${path.replace(/^\/+/,'')}`;
+  const headers = Object.assign({
+    apikey:        SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    'Content-Type':'application/json',
+    Prefer:        'return=representation'
+  }, init.headers || {});
+  const res = await fetch(url, { ...init, headers });
+  if (!res.ok) {
+    const txt = await res.text().catch(()=> '');
+    const err = new Error(`Supabase REST ${res.status}: ${txt}`);
+    err.status = res.status; err.body = txt;
+    throw err;
+  }
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : res.text();
+}
+
+module.exports = (app) => {
+  // Moving window: next_claim_at = last_claim + 3h
+  app.post('/freebies/faucet', requireUser, async (req, res) => {
+    try {
+      const uid = req.user.id;
+      const now = Date.now();
+
+      // 1) last claim for this user
+      const last = await sbRest(
+        `faucet_claims?user_id=eq.${uid}&select=claimed_at&order=claimed_at.desc&limit=1`
+      );
+      const lastAt = last?.[0]?.claimed_at ? new Date(last[0].claimed_at).getTime() : null;
+
+      if (lastAt && now < lastAt + COOLDOWN_MS) {
+        const next = new Date(lastAt + COOLDOWN_MS).toISOString();
+        return res.status(200).json({ ok:false, error:'cooldown', next_claim_at: next });
+      }
+
+      // 2) record claim
+      const claimIso = nowIso();
+      const bucket_epoch = Math.floor(now / COOLDOWN_MS); // optional analytics
+      await sbRest('faucet_claims', {
+        method:'POST',
+        body: JSON.stringify([{ user_id: uid, amount: AMOUNT, claimed_at: claimIso, bucket_epoch }])
+      });
+
+      // 3) credit via the ledger we sum
+      await sbRest('credit_transactions', {
+        method:'POST',
+        body: JSON.stringify([{
+          user_id: uid, delta: AMOUNT, reason: 'faucet_claim',
+          ref_id: `faucet:${uid}:${now}`, created_at: claimIso
+        }])
+      });
+
+      // 4) read fresh balance (unified view)
+      let balance = null;
+      try {
+        const bal = await sbRest(`credits_balance?user_id=eq.${uid}&select=balance&limit=1`);
+        balance = bal?.[0]?.balance ?? null;
+      } catch {}
+
+      return res.json({ ok:true, amount: AMOUNT, balance, next_claim_at: new Date(now + COOLDOWN_MS).toISOString() });
+    } catch (e) {
+      console.error('FAUCET error:', e);
+      return res.status(500).json({ ok:false, error:'faucet_claim_failed', detail:String(e?.message||e) });
+    }
+  });
+};
+'use strict';
+
+const fetch = global.fetch || require('node-fetch');
+const jwt   = require('jsonwebtoken');
+
+const SUPABASE_REST_URL         = process.env.SUPABASE_REST_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const COOKIE_NAME               = process.env.SESSION_COOKIE_NAME || 'pc_session';
+const JWT_SECRET                = process.env.JWT_SECRET || 'dev_only_change_me';
+const ADMIN_IDS = new Set((process.env.PC_ADMIN_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean));
+
+function readSession(req) {
+  try {
+    const t = req.cookies?.[COOKIE_NAME] || (req.headers.cookie || '').split(';').map(s=>s.trim()).find(s=>s.startsWith(COOKIE_NAME+'='))?.split('=')[1];
+    if (!t) return null;
+    return jwt.verify(t, JWT_SECRET);
+  } catch { return null; }
+}
+function requireAuth(req, res, next) {
+  const s = readSession(req);
+  if (!s || !s.id) return res.status(401).json({ error: 'no_session' });
+  req.user = s; next();
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    const s = readSession(req);
+    if (!s || !s.id) return res.status(401).json({ error: 'no_session' });
+    const role = s.role || s.type;
+    if (!(roles.includes(role) || ADMIN_IDS.has(s.id)))
+      return res.status(403).json({ error: 'forbidden' });
+    req.user = s; next();
+  };
+}
+
+async function sbRest(path, init = {}) {
+  const base = SUPABASE_REST_URL.replace(/\/+$/,'');
+  const url  = `${base}/${path.replace(/^\/+/,'')}`;
+  const headers = Object.assign({
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    'Content-Type': 'application/json',
+    Prefer: 'return=representation'
+  }, init.headers || {});
+  const res = await fetch(url, { ...init, headers });
+  if (!res.ok) {
+    const txt = await res.text().catch(()=> '');
+    const err = new Error(`Supabase REST ${res.status}: ${txt}`);
+    err.status = res.status; err.body = txt;
+    throw err;
+  }
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('application/json') ? res.json() : res.text();
+}
+
+const nowIso = () => new Date().toISOString();
+const toDate = (s) => { const d = new Date(s); return isNaN(d.getTime()) ? null : d; };
+function genCode(n){
+  const ALPH='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s=''; for(let i=0;i<n;i++) s += ALPH[Math.floor(Math.random()*ALPH.length)];
+  return s;
+}
+
+module.exports = (app) => {
+  console.log('FREEBIES: mounting /admin/freebies, /freebies/redeem, /freebies/claim, /freebies/faucet');
+
+  // ---------------------------
+  // Admin: create a freebie
+  // ---------------------------
+  app.post('/admin/freebies', requireRole('admin','superadmin'), async (req,res)=>{
+    try{
+      const { amount, expires_at, max_claims, note } = req.body || {};
+      const amt = Number(amount);
+      if (!amt || amt <= 0) return res.status(400).json({ error:'bad_amount' });
+
+      // default expiry = 30 days from now if omitted (to satisfy NOT NULL)
+      const expDate = expires_at ? toDate(expires_at) : new Date(Date.now() + 30*24*60*60*1000);
+      if (!expDate) return res.status(400).json({ error:'bad_expiry' });
+
+      const mc = max_claims != null ? Number(max_claims) : null;
+      if (mc != null && (!Number.isInteger(mc) || mc <= 0)) return res.status(400).json({ error:'bad_max_claims' });
+
+      const code = genCode(10);
+      const payload = [{
+        code,
+        amount: amt,
+        expires_at: expDate.toISOString(),
+        max_claims: mc,
+        created_by: req.user.id,
+        note: note || null,
+        created_at: nowIso()
+      }];
+
+      const rows = await sbRest('freebies', { method:'POST', body: JSON.stringify(payload) });
+      const fb = rows[0];
+      res.json({ ok:true, freebie: { ...fb, link: `https://hub.play-cute.com/freebie/${code}` } });
+    }catch(e){
+      res.status(500).json({ error:'create_failed', detail: String(e.message||e) });
+    }
+  });
+
+  // Admin: list freebies
+  app.get('/admin/freebies', requireRole('admin','superadmin'), async (_req,res)=>{
+    try{
+      const rows = await sbRest('freebies?select=*,claims:freebie_claims(count)');
+      res.json({ ok:true, freebies: rows });
+    }catch(e){
+      res.status(500).json({ error:'list_failed', detail: String(e.message||e) });
+    }
+  });
+
+  // ---------------------------
+  // Player: redeem/claim by code
+  // ---------------------------
+  app.post(['/freebies/claim','/freebies/redeem'], requireAuth, async (req,res)=>{
+    try{
+      const { code } = req.body || {};
+      if (!code || typeof code !== 'string') return res.status(400).json({ error:'bad_code' });
+
+      const rows = await sbRest(`freebies?code=eq.${encodeURIComponent(code)}&select=id,code,amount,expires_at,max_claims&limit=1`);
+      const fb = rows?.[0];
+      if (!fb) return res.status(404).json({ error:'not_found' });
+
+      if (fb.expires_at) {
+        const exp = toDate(fb.expires_at);
+        if (exp && exp.getTime() < Date.now()) return res.status(400).json({ error:'expired' });
+      }
+
+      // insert claim (unique on (freebie_id,user_id) recommended)
+      try{
+        await sbRest('freebie_claims', {
+          method: 'POST',
+          headers: { Prefer: 'resolution=merge-duplicates' },
+          body: JSON.stringify([{ freebie_id: fb.id, user_id: req.user.id, created_at: nowIso() }])
+        });
+      }catch(e){
+        if (e.status === 409) return res.status(409).json({ error:'already_claimed' });
+        throw e;
+      }
+
+      // enforce max_claims best-effort
+      if (fb.max_claims) {
+        const claims = await sbRest(`freebie_claims?freebie_id=eq.${fb.id}&select=id`);
+        if (Array.isArray(claims) && claims.length > fb.max_claims) {
+          await sbRest(`freebie_claims?freebie_id=eq.${fb.id}&user_id=eq.${req.user.id}`, { method:'DELETE' }).catch(()=>{});
+          return res.status(409).json({ error:'max_reached' });
+        }
+      }
+
+      // credit via credit_transactions (this drives credits_balance)
+      const amount = Number(fb.amount) || 0;
+      await sbRest('credit_transactions', {
+        method:'POST',
+        body: JSON.stringify([{
+          user_id: req.user.id,
+          delta: amount,
+          reason: `freebie:${fb.code}`,
+          ref_id: `freebie:${fb.code}:user:${req.user.id}`,
+          created_at: nowIso()
+        }])
+      });
+
+      // fresh balance (if view/table exists)
+      let balance = null;
+      try{
+        const bal = await sbRest(`credits_balance?user_id=eq.${req.user.id}&select=balance&limit=1`);
+        balance = bal?.[0]?.balance ?? null;
+      }catch{}
+
+      res.json({ ok:true, amount, credited:true, balance });
+    }catch(e){
+      res.status(500).json({ error:'claim_failed', detail: String(e.message||e) });
+    }
+  });
+
+  // ---------------------------
+  // Player: faucet (rolling 3h)
+  // ---------------------------
+  app.post('/freebies/faucet', requireAuth, async (req, res) => {
+    console.log('🎯 HIT INDEX.JS FAUCET');
+    try{
+      const uid = req.user.id;
+
+      // find last claim within last 3h
+      const COOL = 3 * 60 * 60 * 1000; // 3 hours ms
+      const since  = new Date(Date.now() - COOL).toISOString();
+      const recent = await sbRest(
+        `faucet_claims?user_id=eq.${uid}&claimed_at=gte.${encodeURIComponent(since)}&select=claimed_at&order=claimed_at.desc&limit=1`
+      );
+      if (Array.isArray(recent) && recent[0]?.claimed_at) {
+        const last = new Date(recent[0].claimed_at).getTime();
+        const next = new Date(last + COOL).toISOString();
+        const remainingSec = Math.ceil((new Date(next).getTime() - Date.now()) / 1000);
+        console.log('⏰ index.js cooldown:', remainingSec);
+        return res.status(200).json({ ok:false, error:'cooldown', cooldown_seconds: remainingSec });
+      }
+
+      // record this claim
+      const now = Date.now();
+      const next_claim_at = new Date(now + COOL).toISOString();
+
+      // try simple insert; if schema requires bucket_epoch, fall back
+      try {
+        await sbRest('faucet_claims', {
+          method:'POST',
+          body: JSON.stringify([{ user_id: uid, amount: 300, claimed_at: new Date(now).toISOString() }])
+        });
+      } catch (e) {
+        // fallback with bucket_epoch if needed
+        const BUCKET = 3 * 60 * 60; // seconds
+        const bucket_epoch = Math.floor(now / 1000 / BUCKET);
+        await sbRest('faucet_claims', {
+          method:'POST',
+          body: JSON.stringify([{
+            user_id: uid, amount: 300,
+            claimed_at: new Date(now).toISOString(),
+            bucket_epoch
+          }])
+        });
+      }
+
+      // credit +300
+      await sbRest('credit_transactions', {
+        method:'POST',
+        body: JSON.stringify([{
+          user_id: uid,
+          delta: 300,
+          reason: 'faucet_claim',
+          ref_id: `faucet:${uid}:${now}`,
+          created_at: nowIso()
+        }])
+      });
+
+      // fresh balance
+      let balance = null;
+      try{
+        const bal = await sbRest(`credits_balance?user_id=eq.${uid}&select=balance&limit=1`);
+        balance = bal?.[0]?.balance ?? null;
+      }catch{}
+
+      console.log('✅ index.js claimed');
+      return res.status(200).json({ ok:true, amount:300, balance, cooldown_seconds: 10800 });
+    }catch(e){
+      return res.status(500).json({ ok:false, error:'faucet_claim_failed', detail: String(e.message||e) });
+    }
+  });
+
+  console.log('FREEBIES: routes mounted OK');
+};
